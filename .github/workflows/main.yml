@@ -1,0 +1,119 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2025
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Require Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 1 -Force
+
+          # Firewall rule for RDP
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Configure runneradmin for RDP
+        run: |
+          $username = "runneradmin"
+          $password = "P@ssw0rd123!"
+
+          Enable-LocalUser -Name $username
+          Set-LocalUser -Name $username -Password (ConvertTo-SecureString -AsPlainText $password -Force)
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.102.4-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=$env:TAILSCALE_AUTHKEY `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: WARMUP
+        env:
+          TG_SESSION_DATA: ${{ secrets.TG_SESSION_DATA }}
+        run: |
+          # 1. এনভায়রনমেন্ট ভ্যারিয়েবল সেট করা
+          [System.Environment]::SetEnvironmentVariable('TG_SESSION_DATA', $env:TG_SESSION_DATA, 'Machine')
+          [System.Environment]::SetEnvironmentVariable('TG_SESSION_DATA', $env:TG_SESSION_DATA, 'User')
+
+          # 2. Desktop ফোল্ডারে run.bat কপি করা
+          $desktopPath = "C:\Users\runneradmin\Desktop"
+          if (!(Test-Path $desktopPath)) { New-Item -ItemType Directory -Path $desktopPath -Force }
+
+          $batSource = Join-Path $env:GITHUB_WORKSPACE "run.bat"
+          $batDest = Join-Path $desktopPath "run.bat"
+          Copy-Item -Path $batSource -Destination $batDest -Force
+
+          # 3. ব্যাকগ্রাউন্ড প্রসেস চালু করা (অ্যাকশন লগ সম্পূর্ণ ক্লিন থাকবে)
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$batDest`"" -WorkingDirectory $desktopPath -WindowStyle Hidden
+          Write-Host "Warmup script initiated in background."
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "==================`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
